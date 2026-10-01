@@ -190,8 +190,8 @@ check_anthropic_access() {
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://api.anthropic.com/v1/models 2>/dev/null) || code=000
   case "$code" in
-    401|404|405) ok "API Anthropic доступен с IP этого сервера" ;;
-    403) warn "api.anthropic.com ответил 403: похоже, страна сервера не поддерживается Anthropic (https://www.anthropic.com/supported-countries). Установка продолжится, но Claude Code здесь может не работать." ;;
+    401|404|405) ok "API Anthropic доступен с этого сервера" ;;
+    403) warn "api.anthropic.com ответил 403 на проверочный запрос. Установка продолжится; если Claude Code не сможет обратиться к API, уточните у хостинга ограничения исходящих соединений." ;;
     *) warn "Не удалось проверить доступ к api.anthropic.com (HTTP $code). Продолжаю." ;;
   esac
 }
@@ -464,10 +464,11 @@ Description=claude-code-vps: remove temporary installation sudo rule
 [Timer]
 OnActiveSec=1h
 EOF
-  systemctl daemon-reload \
-    && systemctl enable "${SUDO_CLEANUP_UNIT}.service" >/dev/null 2>&1 \
-    && systemctl restart "${SUDO_CLEANUP_UNIT}.timer" \
-    || die "Не удалось включить очистку временного sudo (systemd). Остановлено, sudo не менялся."
+  if ! { systemctl daemon-reload \
+      && systemctl enable "${SUDO_CLEANUP_UNIT}.service" >/dev/null 2>&1 \
+      && systemctl restart "${SUDO_CLEANUP_UNIT}.timer"; }; then
+    die "Не удалось включить очистку временного sudo (systemd). Остановлено, sudo не менялся."
+  fi
 }
 
 disarm_sudo_cleanup() {

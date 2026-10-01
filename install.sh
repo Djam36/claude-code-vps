@@ -5,18 +5,16 @@
 #   curl -fsSL https://raw.githubusercontent.com/Djam36/claude-code-vps/main/install.sh | bash
 #
 # After setup the same script is installed as `claude-vps`:
-#   claude-vps login         browser through the VPS + Claude Code login
-#   claude-vps browser [url] only the browser through the VPS (SOCKS5 over SSH)
+#   claude-vps login         log in to Claude Code on the VPS (official URL + code flow)
 #   claude-vps open <port>   open a site that runs on the VPS (SSH port forwarding)
 #   claude-vps attach        tmux session on the VPS that survives disconnects
 #   claude-vps setup         run the installation again
 #
-# Nothing graphical is installed on the server: the browser runs on your computer
-# and only its traffic goes through the server via `ssh -D` (dynamic port forwarding).
+# Nothing graphical is installed on the server: you work over SSH from your computer.
 
 set -Eeuo pipefail
 
-readonly CCV_VERSION="1.0.0"
+readonly CCV_VERSION="1.1.0"
 readonly CCV_API=1
 readonly BASE_URL="${CCV_BASE_URL:-https://raw.githubusercontent.com/Djam36/claude-code-vps/main}"
 # The alias chosen at setup is remembered, so daily commands find the same server.
@@ -30,13 +28,11 @@ readonly SSH_DIR="${HOME}/.ssh"
 readonly KEY_PATH="${SSH_DIR}/claude_vps_ed25519"
 readonly SSH_CONFIG="${SSH_DIR}/config"
 readonly BIN_DIR="${HOME}/.local/bin"
-readonly LOGIN_URL="https://claude.ai/login"
 readonly SELF="${BASH_SOURCE[0]:-}"
 
 HOST="${CCV_HOST:-}"
 PORT="${CCV_PORT:-}"
 BOOTSTRAP=""
-SOCKS_PORT=""
 TUNNEL_PID=""
 SUDO_PASSWORD_PATH=""
 TMP_FILES=()
@@ -83,13 +79,20 @@ tty_or_null() {
   if tty_in; then printf '/dev/tty'; else printf '/dev/null'; fi
 }
 
+# Prints a TCP port (1-65535) in decimal; leading zeros are not read as octal.
+valid_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+  local port=$((10#$1))
+  (( port >= 1 && port <= 65535 )) || return 1
+  printf '%d' "$port"
+}
+
 usage() {
   cat <<EOF
 claude-vps ${CCV_VERSION} — Claude Code на вашем VPS без рабочего стола на сервере.
 
   claude-vps setup          установить или перенастроить сервер
-  claude-vps login          браузер через сервер + вход в Claude Code
-  claude-vps browser [url]  только браузер, который ходит в интернет через сервер
+  claude-vps login          войти в Claude Code на сервере (ссылка + код)
   claude-vps open <порт>    открыть сайт, запущенный на сервере (например 3000)
   claude-vps attach         сессия tmux на сервере, которая переживает обрывы связи
   claude-vps help           эта справка
@@ -115,7 +118,7 @@ collect_input() {
     PORT=$(tty_read 'SSH-порт [22]: ')
     PORT=${PORT:-22}
   fi
-  [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && PORT=$((10#$PORT)) && (( PORT >= 1 && PORT <= 65535 )) || die "SSH-порт должен быть числом от 1 до 65535."
+  PORT=$(valid_port "$PORT") || die "SSH-порт должен быть числом от 1 до 65535."
   [[ "$WORK_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$WORK_USER" != root ]] || die "CCV_USER: недопустимое имя пользователя '$WORK_USER'."
   [[ "$SUDO_MODE" == password || "$SUDO_MODE" == nopasswd ]] || die "CCV_SUDO может быть только password или nopasswd."
 
@@ -147,8 +150,7 @@ push_key() {
   pub=$(tr -d '\r\n' < "${KEY_PATH}.pub")
   [[ "$pub" != *"'"* ]] || die "Неожиданный формат публичного ключа."
   info "Шаг 1/5. Добавляю ключ на сервер."
-  printf 'Сервер один раз спросит пароль %s. При вводе пароля символы не отображаются — это нормально.\n' "$ADMIN_USER"
-  printf 'Если SSH спросит про отпечаток сервера (fingerprint), ответьте yes.\n\n'
+  printf 'Сервер один раз спросит пароль %s. При вводе пароля символы не отображаются — это нормально.\n\n' "$ADMIN_USER"
   ssh -n -p "$PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
     "$ADMIN_USER@$HOST" \
     "umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys)" \
@@ -271,6 +273,7 @@ install_helper() {
       local rc
       rc=$(shell_rc_file)
       if ! grep -qs '# claude-code-vps PATH' "$rc"; then
+        # shellcheck disable=SC2016  # $HOME and $PATH must expand when the rc file runs.
         printf '\nexport PATH="$HOME/.local/bin:$PATH"  # claude-code-vps PATH\n' >> "$rc"
       fi
       warn "Команда claude-vps заработает в новом окне терминала (PATH дописан в $rc)."
@@ -323,6 +326,7 @@ cmd_setup() {
 
   info "Шаг 5/5. Включаю защиту: SSH только по ключу, UFW, fail2ban, автообновления..."
   # The remote shell expands SSH_CONNECTION: UFW must keep the port we are connected through open.
+  # shellcheck disable=SC2016  # expanded by the remote shell, not here.
   run_phase "$WORK_USER" harden "$WORK_USER" '${SSH_CONNECTION##* }' \
     || die "Защита не включилась. Текст ошибки выше; журнал на сервере: /var/log/claude-vps-install.log"
   key_login_ok "$WORK_USER" || die "После включения защиты вход под $WORK_USER не проверился. Откройте консоль в панели хостинга и проверьте /etc/ssh/sshd_config.d/00-claude-vps.conf."
@@ -384,112 +388,6 @@ start_tunnel() {
   die "SSH-туннель не ответил за 20 секунд. Проверьте: ssh $ALIAS"
 }
 
-start_socks() {
-  require_alias
-  SOCKS_PORT=$(pick_port 1080 1099) || die "Локальные порты 1080–1099 заняты. Закройте старые туннели и повторите."
-  start_tunnel "$SOCKS_PORT" -D "127.0.0.1:${SOCKS_PORT}"
-  local ip
-  if ip=$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null); then
-    ok "Туннель поднят: браузер будет выходить в интернет с IP сервера ${ip}"
-  else
-    ok "Туннель поднят на 127.0.0.1:${SOCKS_PORT}"
-  fi
-}
-
-firefox_profile() {
-  local dir="$CCV_HOME/browser/firefox-${SOCKS_PORT}"
-  mkdir -p "$dir"
-  cat > "$dir/user.js" <<EOF
-user_pref("network.proxy.type", 1);
-user_pref("network.proxy.socks", "127.0.0.1");
-user_pref("network.proxy.socks_port", ${SOCKS_PORT});
-user_pref("network.proxy.socks_version", 5);
-user_pref("network.proxy.socks_remote_dns", true);
-user_pref("network.proxy.no_proxies_on", "");
-user_pref("media.peerconnection.enabled", false);
-user_pref("browser.shell.checkDefaultBrowser", false);
-EOF
-  printf '%s' "$dir"
-}
-
-manual_browser_hint() {
-  local url=$1
-  warn "Не нашёл Chrome, Edge, Chromium, Brave, Yandex или Firefox для автоматического запуска."
-  printf 'Настройте прокси вручную в любом браузере: SOCKS5, адрес 127.0.0.1, порт %s,\n' "$SOCKS_PORT"
-  printf 'включите «DNS через прокси» (в Firefox: Proxy DNS when using SOCKS v5). Затем откройте %s\n' "$url"
-}
-
-# Launches a separate browser profile whose traffic goes through the SOCKS tunnel.
-launch_browser() {
-  local url=$1
-  mkdir -p "$CCV_HOME/browser"
-  local profile="$CCV_HOME/browser/chromium-${SOCKS_PORT}"
-  local proxy="socks5://127.0.0.1:${SOCKS_PORT}"
-  local -a chromium_flags=(
-    "--proxy-server=${proxy}"
-    "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"
-    "--no-first-run" "--no-default-browser-check" "--new-window"
-  )
-
-  case "$(uname -s)" in
-    Darwin)
-      local app
-      for app in "Google Chrome" "Chromium" "Microsoft Edge" "Brave Browser" "Yandex" "Vivaldi"; do
-        if [[ -d "/Applications/${app}.app" || -d "$HOME/Applications/${app}.app" ]]; then
-          open -na "$app" --args "--user-data-dir=${profile}" "${chromium_flags[@]}" "$url"
-          ok "Открыт ${app} в отдельном профиле через сервер"
-          return 0
-        fi
-      done
-      if [[ -d "/Applications/Firefox.app" ]]; then
-        open -na Firefox --args -profile "$(firefox_profile)" -no-remote "$url"
-        ok "Открыт Firefox в отдельном профиле через сервер"
-        return 0
-      fi
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      local exe candidate
-      for candidate in \
-        "${PROGRAMFILES:-C:\\Program Files}\\Google\\Chrome\\Application\\chrome.exe" \
-        "${LOCALAPPDATA:-}\\Google\\Chrome\\Application\\chrome.exe" \
-        "${PROGRAMFILES:-C:\\Program Files} (x86)\\Microsoft\\Edge\\Application\\msedge.exe" \
-        "${PROGRAMFILES:-C:\\Program Files}\\Microsoft\\Edge\\Application\\msedge.exe"; do
-        exe=$(cygpath -u "$candidate" 2>/dev/null) || continue
-        if [[ -f "$exe" ]]; then
-          "$exe" "--user-data-dir=$(cygpath -w "$profile")" "${chromium_flags[@]}" "$url" >/dev/null 2>&1 &
-          disown || true
-          ok "Открыт $(basename "$exe") в отдельном профиле через сервер"
-          return 0
-        fi
-      done
-      ;;
-    *)
-      if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
-        warn "В WSL браузер автоматически не запускается. Удобнее установщик для PowerShell (см. README)."
-        manual_browser_hint "$url"
-        return 0
-      fi
-      local bin
-      for bin in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge \
-                 microsoft-edge-stable brave-browser yandex-browser vivaldi; do
-        if command -v "$bin" >/dev/null 2>&1; then
-          nohup "$bin" "--user-data-dir=${profile}" "${chromium_flags[@]}" "$url" >/dev/null 2>&1 &
-          disown || true
-          ok "Открыт ${bin} в отдельном профиле через сервер"
-          return 0
-        fi
-      done
-      if command -v firefox >/dev/null 2>&1; then
-        nohup firefox -profile "$(firefox_profile)" -no-remote "$url" >/dev/null 2>&1 &
-        disown || true
-        ok "Открыт Firefox в отдельном профиле через сервер"
-        return 0
-      fi
-      ;;
-  esac
-  manual_browser_hint "$url"
-}
-
 open_local_url() {
   local url=$1
   case "$(uname -s)" in
@@ -506,50 +404,34 @@ wait_enter() {
 # --------------------------------------------------------------- commands ----
 
 cmd_login() {
-  need ssh; need curl
+  need ssh
+  require_alias
   info "Вход в Claude Code"
-  start_socks
-  launch_browser "$LOGIN_URL"
   cat <<EOF
 
-Как войти:
-  1. В открывшемся окне браузера войдите в свой аккаунт Claude.
-     Это окно ходит в интернет через ваш сервер, поэтому claude.ai его пускает.
-  2. Ниже запустится Claude Code на сервере. Выберите тему, затем
-     «Claude account with subscription».
-  3. Claude Code покажет ссылку. Нажмите c (скопировать) или выделите её мышью
-     и откройте в ТОМ ЖЕ окне браузера, что открылось на шаге 1.
-  4. Нажмите Authorize, скопируйте показанный код и вставьте его в терминал
-     в строку «Paste code here». Затем Enter.
-  5. Проверка: команда /status. Выход из Claude Code: /exit.
+Сейчас на сервере запустится официальный вход Claude Code (claude auth login):
+  1. В терминале появится ссылка. Скопируйте её и откройте в обычном браузере
+     на своём компьютере.
+  2. Войдите в свой аккаунт Claude и нажмите Authorize.
+  3. Скопируйте показанный код и вставьте его в терминал в строку
+     «Paste code here if prompted». Затем Enter.
+  4. Появится «Login successful».
 
 EOF
-  wait_enter "Нажмите Enter, чтобы запустить Claude Code на сервере..."
-  ssh -t "$ALIAS" 'cd ~/work 2>/dev/null; claude' <"$(tty_or_null)" || true
-  stop_tunnel
-  ok "Туннель закрыт. Дальше работайте через VS Code или ssh ${ALIAS}"
-}
-
-cmd_browser() {
-  need ssh; need curl
-  local url=${1:-$LOGIN_URL}
-  start_socks
-  launch_browser "$url"
-  printf '\nПока это окно открыто, браузер ходит в интернет через сервер.\n'
-  printf 'Сюда можно вставить ссылку входа из расширения Claude Code в VS Code.\n'
-  wait_enter "Нажмите Enter, чтобы закрыть туннель..."
-  stop_tunnel
-  ok "Туннель закрыт"
+  if ssh -t "$ALIAS" 'claude auth login' <"$(tty_or_null)"; then
+    ok "Вход выполнен. Работайте через VS Code, ssh ${ALIAS} или claude-vps attach"
+  else
+    die "Вход не завершился. Повторите: claude-vps login"
+  fi
 }
 
 cmd_open() {
   need ssh
   require_alias
-  local remote_port=${1:-}
-  [[ "$remote_port" =~ ^[0-9]+$ ]] && (( remote_port >= 1 && remote_port <= 65535 )) \
-    || die "Укажите порт сайта на сервере, например: claude-vps open 3000"
-  local local_port
-  local_port=$(pick_port "$remote_port" "$((remote_port + 20))") || die "Локальные порты ${remote_port}–$((remote_port + 20)) заняты."
+  local remote_port last_port local_port
+  remote_port=$(valid_port "${1:-}") || die "Укажите порт сайта на сервере, например: claude-vps open 3000"
+  last_port=$(( remote_port + 20 > 65535 ? 65535 : remote_port + 20 ))
+  local_port=$(pick_port "$remote_port" "$last_port") || die "Локальные порты ${remote_port}–${last_port} заняты."
   start_tunnel "$local_port" -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}"
   local url="http://127.0.0.1:${local_port}"
   ok "Порт ${remote_port} сервера доступен у вас по адресу ${url}"
@@ -570,7 +452,6 @@ main() {
   case "$command" in
     setup|install) cmd_setup ;;
     login) cmd_login ;;
-    browser) cmd_browser "$@" ;;
     open) cmd_open "$@" ;;
     attach) cmd_attach ;;
     version|--version|-v) printf 'claude-vps %s\n' "$CCV_VERSION" ;;

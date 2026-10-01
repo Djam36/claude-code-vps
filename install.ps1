@@ -3,19 +3,19 @@
 #   irm https://raw.githubusercontent.com/Djam36/claude-code-vps/main/install.ps1 | iex
 #
 # After setup the command `claude-vps` is available in new terminal windows:
-#   claude-vps login         browser through the VPS + Claude Code login
-#   claude-vps browser [url] only the browser through the VPS (SOCKS5 over SSH)
+#   claude-vps login         log in to Claude Code on the VPS (official URL + code flow)
 #   claude-vps open <port>   open a site that runs on the VPS (SSH port forwarding)
 #   claude-vps attach        tmux session on the VPS that survives disconnects
 #   claude-vps setup         run the installation again
 #
 # Everything runs inside one script block so nothing leaks into the caller's session
-# when the script is piped into Invoke-Expression; `exit` is never used for the same reason.
+# when the script is piped into Invoke-Expression. For the same reason `exit` is used only
+# when the script runs as a file (the installed helper), to return a failure exit code.
 
 & {
 $ErrorActionPreference = 'Stop'
 
-$CcvVersion = '1.0.0'
+$CcvVersion = '1.1.0'
 $CcvApi = 1
 $BaseUrl = if ($env:CCV_BASE_URL) { $env:CCV_BASE_URL } else { 'https://raw.githubusercontent.com/Djam36/claude-code-vps/main' }
 $CcvHome = Join-Path $env:USERPROFILE '.claude-vps'
@@ -28,7 +28,6 @@ if (-not $Alias) { $Alias = 'claude-vps' }
 $WorkUser = if ($env:CCV_USER) { $env:CCV_USER } else { 'dev' }
 $AdminUser = if ($env:CCV_ADMIN_USER) { $env:CCV_ADMIN_USER } else { 'root' }
 $SudoMode = if ($env:CCV_SUDO) { $env:CCV_SUDO } else { 'password' }
-$LoginUrl = 'https://claude.ai/login'
 
 $BinDir = Join-Path $CcvHome 'bin'
 $HelperPs1 = Join-Path $CcvHome 'claude-vps.ps1'
@@ -38,7 +37,7 @@ $SshConfig = Join-Path $SshDir 'config'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
 # Shared mutable state (a hashtable avoids scope surprises under Invoke-Expression).
-$S = @{ Host = $env:CCV_HOST; Port = $env:CCV_PORT; Tunnel = $null; SocksPort = 0; SudoPasswordPath = $null; Bootstrap = $null; TempFiles = @() }
+$S = @{ Host = $env:CCV_HOST; Port = $env:CCV_PORT; Tunnel = $null; SudoPasswordPath = $null; Bootstrap = $null; TempFiles = @() }
 $Self = $PSCommandPath
 
 function Write-Info([string]$Text) { Write-Host ''; Write-Host $Text -ForegroundColor Cyan }
@@ -59,8 +58,7 @@ function Show-Usage {
 claude-vps $CcvVersion — Claude Code на вашем VPS без рабочего стола на сервере.
 
   claude-vps setup          установить или перенастроить сервер
-  claude-vps login          браузер через сервер + вход в Claude Code
-  claude-vps browser [url]  только браузер, который ходит в интернет через сервер
+  claude-vps login          войти в Claude Code на сервере (ссылка + код)
   claude-vps open <порт>    открыть сайт, запущенный на сервере (например 3000)
   claude-vps attach         сессия tmux на сервере, которая переживает обрывы связи
   claude-vps help           эта справка
@@ -136,7 +134,6 @@ function Push-Key {
   if ($pub.Contains("'") -or $pub.Contains('"')) { Fail 'Неожиданный формат публичного ключа.' }
   Write-Info 'Шаг 1/5. Добавляю ключ на сервер.'
   Write-Host "Сервер один раз спросит пароль $AdminUser. При вводе пароля символы не отображаются — это нормально."
-  Write-Host 'Если SSH спросит про отпечаток сервера (fingerprint), ответьте yes.'
   Write-Host ''
   $remote = "umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys)"
   & $Ssh -p "$($S.Port)" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$AdminUser@$($S.Host)" $remote
@@ -385,116 +382,25 @@ function Start-Tunnel([int]$LocalPort, [string]$Forward) {
   Fail "SSH-туннель не ответил за 20 секунд. Проверьте: ssh $Alias"
 }
 
-function Start-Socks {
-  Assert-Alias
-  $S.SocksPort = Get-FreePort 1080 1099
-  if ($S.SocksPort -eq 0) { Fail 'Локальные порты 1080–1099 заняты. Закройте старые туннели и повторите.' }
-  Start-Tunnel $S.SocksPort "-D 127.0.0.1:$($S.SocksPort)"
-  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-  $ip = $null
-  if ($curl) {
-    $ErrorActionPreference = 'Continue'
-    $ip = & $curl.Source -fsS --max-time 15 --socks5-hostname "127.0.0.1:$($S.SocksPort)" https://api.ipify.org 2>$null
-  }
-  if ($ip) {
-    Write-Ok "Туннель поднят: браузер будет выходить в интернет с IP сервера $ip"
-  } else {
-    Write-Ok "Туннель поднят на 127.0.0.1:$($S.SocksPort)"
-  }
-}
-
-function Find-Browser {
-  $pf = $env:ProgramFiles
-  $pf86 = ${env:ProgramFiles(x86)}
-  $lad = $env:LOCALAPPDATA
-  $candidates = @(
-    @{ Kind = 'chromium'; Path = "$pf\Google\Chrome\Application\chrome.exe" },
-    @{ Kind = 'chromium'; Path = "$pf86\Google\Chrome\Application\chrome.exe" },
-    @{ Kind = 'chromium'; Path = "$lad\Google\Chrome\Application\chrome.exe" },
-    @{ Kind = 'chromium'; Path = "$pf86\Microsoft\Edge\Application\msedge.exe" },
-    @{ Kind = 'chromium'; Path = "$pf\Microsoft\Edge\Application\msedge.exe" },
-    @{ Kind = 'chromium'; Path = "$pf\BraveSoftware\Brave-Browser\Application\brave.exe" },
-    @{ Kind = 'chromium'; Path = "$lad\BraveSoftware\Brave-Browser\Application\brave.exe" },
-    @{ Kind = 'chromium'; Path = "$lad\Yandex\YandexBrowser\Application\browser.exe" },
-    @{ Kind = 'chromium'; Path = "$lad\Vivaldi\Application\vivaldi.exe" },
-    @{ Kind = 'firefox'; Path = "$pf\Mozilla Firefox\firefox.exe" },
-    @{ Kind = 'firefox'; Path = "$pf86\Mozilla Firefox\firefox.exe" }
-  )
-  foreach ($candidate in $candidates) {
-    if ($candidate.Path -and (Test-Path $candidate.Path)) { return $candidate }
-  }
-  return $null
-}
-
-# Launches a separate browser profile whose traffic goes through the SOCKS tunnel.
-function Start-ProxyBrowser([string]$Url) {
-  $browser = Find-Browser
-  $port = $S.SocksPort
-  if (-not $browser) {
-    Write-Warn 'Не нашёл Chrome, Edge, Brave, Yandex или Firefox для автоматического запуска.'
-    Write-Host "Настройте прокси вручную: SOCKS5, адрес 127.0.0.1, порт $port, включите «DNS через прокси». Затем откройте $Url"
-    return
-  }
-  $profileRoot = Join-Path $CcvHome 'browser'
-  if ($browser.Kind -eq 'chromium') {
-    $profile = Join-Path $profileRoot "chromium-$port"
-    $arguments = "--user-data-dir=`"$profile`" --proxy-server=socks5://127.0.0.1:$port `"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1`" --no-first-run --no-default-browser-check --new-window $Url"
-  } else {
-    $profile = Join-Path $profileRoot "firefox-$port"
-    if (-not (Test-Path $profile)) { New-Item -ItemType Directory -Path $profile -Force | Out-Null }
-    $prefs = @(
-      'user_pref("network.proxy.type", 1);',
-      'user_pref("network.proxy.socks", "127.0.0.1");',
-      "user_pref(`"network.proxy.socks_port`", $port);",
-      'user_pref("network.proxy.socks_version", 5);',
-      'user_pref("network.proxy.socks_remote_dns", true);',
-      'user_pref("network.proxy.no_proxies_on", "");',
-      'user_pref("media.peerconnection.enabled", false);',
-      'user_pref("browser.shell.checkDefaultBrowser", false);'
-    ) -join "`n"
-    [System.IO.File]::WriteAllText((Join-Path $profile 'user.js'), $prefs + "`n", $Utf8NoBom)
-    $arguments = "-profile `"$profile`" -no-remote $Url"
-  }
-  Start-Process -FilePath $browser.Path -ArgumentList $arguments | Out-Null
-  Write-Ok "Открыт $([System.IO.Path]::GetFileNameWithoutExtension($browser.Path)) в отдельном профиле через сервер"
-}
-
 # --------------------------------------------------------------- commands ----
 
 function Invoke-Login {
+  Assert-Alias
   Write-Info 'Вход в Claude Code'
-  Start-Socks
-  Start-ProxyBrowser $LoginUrl
   Write-Host @'
 
-Как войти:
-  1. В открывшемся окне браузера войдите в свой аккаунт Claude.
-     Это окно ходит в интернет через ваш сервер, поэтому claude.ai его пускает.
-  2. Ниже запустится Claude Code на сервере. Выберите тему, затем
-     «Claude account with subscription».
-  3. Claude Code покажет ссылку. Нажмите c (скопировать) или выделите её мышью
-     и откройте в ТОМ ЖЕ окне браузера, что открылось на шаге 1.
-  4. Нажмите Authorize, скопируйте показанный код и вставьте его в терминал
-     в строку «Paste code here» (правая кнопка мыши или Ctrl+V). Затем Enter.
-  5. Проверка: команда /status. Выход из Claude Code: /exit.
+Сейчас на сервере запустится официальный вход Claude Code (claude auth login):
+  1. В терминале появится ссылка. Скопируйте её и откройте в обычном браузере
+     на своём компьютере.
+  2. Войдите в свой аккаунт Claude и нажмите Authorize.
+  3. Скопируйте показанный код и вставьте его в терминал в строку
+     «Paste code here if prompted» (правая кнопка мыши или Ctrl+V). Затем Enter.
+  4. Появится «Login successful».
 
 '@
-  Read-Host 'Нажмите Enter, чтобы запустить Claude Code на сервере' | Out-Null
-  & $Ssh -t $Alias 'cd ~/work 2>/dev/null; claude'
-  Stop-Tunnel
-  Write-Ok "Туннель закрыт. Дальше работайте через VS Code или ssh $Alias"
-}
-
-function Invoke-Browser([string]$Url) {
-  if (-not $Url) { $Url = $LoginUrl }
-  Start-Socks
-  Start-ProxyBrowser $Url
-  Write-Host ''
-  Write-Host 'Пока это окно открыто, браузер ходит в интернет через сервер.'
-  Write-Host 'Сюда можно вставить ссылку входа из расширения Claude Code в VS Code.'
-  Read-Host 'Нажмите Enter, чтобы закрыть туннель' | Out-Null
-  Stop-Tunnel
-  Write-Ok 'Туннель закрыт'
+  & $Ssh -t $Alias 'claude auth login'
+  if ($LASTEXITCODE -ne 0) { Fail 'Вход не завершился. Повторите: claude-vps login' }
+  Write-Ok "Вход выполнен. Работайте через VS Code, ssh $Alias или claude-vps attach"
 }
 
 function Invoke-Open([string]$RemotePort) {
@@ -524,26 +430,34 @@ function Invoke-Main([object[]]$Arguments) {
   $rest = $null
   if ($Arguments -and $Arguments.Count -gt 1) { $rest = [string]$Arguments[1] }
 
+  # Tools are looked up per command, so `help` works without OpenSSH. The command
+  # functions called below see these variables through PowerShell dynamic scoping.
+  $Ssh = $null; $Scp = $null; $SshKeygen = $null
+  if ($command -in @('setup', 'install', 'login', 'open', 'attach')) { $Ssh = Find-Tool 'ssh.exe' }
+  if ($command -in @('setup', 'install')) {
+    $Scp = Find-Tool 'scp.exe'
+    $SshKeygen = Find-Tool 'ssh-keygen.exe'
+  }
+
   switch ($command) {
     { $_ -in @('setup', 'install') } { Invoke-Setup; break }
     'login' { Invoke-Login; break }
-    'browser' { Invoke-Browser $rest; break }
     'open' { Invoke-Open $rest; break }
     'attach' { Invoke-Attach; break }
     { $_ -in @('version', '--version', '-v') } { Write-Host "claude-vps $CcvVersion"; break }
-    default { Show-Usage }
+    { $_ -in @('help', '--help', '-h') } { Show-Usage; break }
+    default { Show-Usage; Fail "Неизвестная команда: $command" }
   }
 }
 
 $previousEncoding = [Console]::OutputEncoding
+$failed = $false
 try {
   # Server output is UTF-8; without this the Russian text from bootstrap.sh turns into mojibake.
   [Console]::OutputEncoding = $Utf8NoBom
-  $Ssh = Find-Tool 'ssh.exe'
-  $Scp = Find-Tool 'scp.exe'
-  $SshKeygen = Find-Tool 'ssh-keygen.exe'
   Invoke-Main $args
 } catch {
+  $failed = $true
   Write-Host ''
   Write-Host ('Ошибка: ' + $_.Exception.Message) -ForegroundColor Red
 } finally {
@@ -551,4 +465,5 @@ try {
   foreach ($file in $S.TempFiles) { Remove-Item -Force -ErrorAction SilentlyContinue $file }
   [Console]::OutputEncoding = $previousEncoding
 }
+if ($failed -and $Self) { exit 1 }
 } @args
